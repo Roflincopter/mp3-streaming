@@ -31,6 +31,7 @@ int main(int argc, char* argv[]) {
 			throw std::runtime_error(filename + " is not an valid mp3 file.");
 		}
 		offset = mp3_file->firstFrameOffset();
+		offset = mp3_file->nextFrameOffset(offset + 2000000);
 	}
 
 	std::ifstream mp3(filename);
@@ -79,9 +80,8 @@ int main(int argc, char* argv[]) {
 		throw std::runtime_error("Failed to start portaudio stream.");
 	}
 
-	float buffer[2][1152];
-
-	for(int i = 0; i < 40 * 60; i++) {
+	std::vector<float> buffer;
+	while(mp3_stream.error != MAD_ERROR_BUFLEN) { //EOB
 		mad_frame_decode(&frame, &mp3_stream);
 
 		mad_synth synth;
@@ -89,14 +89,19 @@ int main(int argc, char* argv[]) {
 
 		mad_synth_frame(&synth, &frame);
 
+		unsigned short nr_channels = synth.pcm.channels;
+		unsigned short nr_samples = synth.pcm.length;
 
-		for(int i = 0; i < 2; i++) {
-			for(int j = 0; j < 1152; j++) {
-				buffer[i][j] = mad_f_todouble(synth.pcm.samples[i][j]);
+		buffer.resize(nr_channels * nr_samples);
+
+		for(int i = 0; i < nr_channels; i++) {
+			for(int j = 0; j < synth.pcm.length; j++) {
+				buffer[(nr_channels*j) + i] = static_cast<float>(mad_f_todouble(synth.pcm.samples[i][j])) / 8;
 			}
 		}
 
-		error = Pa_WriteStream(stream, buffer, synth.pcm.length);
+
+		error = Pa_WriteStream(stream, buffer.data(), synth.pcm.length);
 		if(error != paNoError) {
 			throw std::runtime_error("Failed to write to stream.");
 		}
