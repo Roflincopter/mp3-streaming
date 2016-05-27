@@ -8,6 +8,85 @@
 #include <vector>
 #include <cstdint>
 #include <iostream>
+#include <memory>
+
+class Mp3FrameGenerator {
+	mad_stream stream;
+	mad_frame frame;
+	mad_synth synth;
+
+	std::vector<uint8_t> mp3_contents;
+public:
+
+	Mp3FrameGenerator(Mp3FrameGenerator const&)	= delete;
+
+	Mp3FrameGenerator(std::string filename)
+	: stream()
+	, frame()
+	, synth()
+	{
+		mad_stream_init(&stream);
+		mad_frame_init(&frame);
+		mad_synth_init(&synth);
+
+		long offset;
+		{
+			TagLib::FileRef ref(filename.c_str());
+			TagLib::File* file = ref.file();
+
+			TagLib::MPEG::File* mp3_file = dynamic_cast<TagLib::MPEG::File*>(file);
+			if(!mp3_file) {
+				throw std::runtime_error(filename + " is not an valid mp3 file.");
+			}
+			offset = mp3_file->firstFrameOffset();
+			//offset = mp3_file->nextFrameOffset(offset + 2000000);
+		}
+
+		std::ifstream mp3(filename);
+		if(!mp3) {
+			throw std::runtime_error("Failed to open: " + filename);
+		}
+		mp3_contents = std::vector<uint8_t>((std::istreambuf_iterator<char>(mp3)), std::istreambuf_iterator<char>());
+		mp3.close();
+
+		mad_stream_buffer(&stream, mp3_contents.data(), mp3_contents.size());
+		mad_stream_skip(&stream, offset);
+	}
+
+	std::vector<float> generate_pcm_data() {
+		mad_frame_decode(&frame, &stream);
+		mad_synth_frame(&synth, &frame);
+
+		unsigned short nr_channels = synth.pcm.channels;
+		unsigned short nr_samples = synth.pcm.length;
+
+		std::vector<float> buffer;
+		buffer.resize(nr_channels * nr_samples);
+		for(int i = 0; i < nr_channels; i++) {
+			for(int j = 0; j < synth.pcm.length; j++) {
+				buffer[(nr_channels*j) + i] = static_cast<float>(mad_f_todouble(synth.pcm.samples[i][j])) / 8;
+			}
+		}
+
+		return buffer;
+	}
+
+	virtual ~Mp3FrameGenerator() {
+		mad_stream_finish(&stream);
+		mad_frame_finish(&frame);
+		mad_synth_finish(&synth);
+	}
+};
+
+int play_callback(const void*, void *output, unsigned long frameCount, const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void *userData) {
+	auto& gen = *static_cast<Mp3FrameGenerator*>(userData);
+
+	std::vector<float> buffer = gen.generate_pcm_data();
+	std::copy_n(buffer.data(), buffer.size(), (float*) output);
+
+	return paContinue;
+}
+
 
 int main(int argc, char* argv[]) {
 
@@ -21,34 +100,7 @@ int main(int argc, char* argv[]) {
 		filename = std::string(argv[1]);
 	}
 
-	long offset;
-	{
-		TagLib::FileRef ref(filename.c_str());
-		TagLib::File* file = ref.file();
-
-		TagLib::MPEG::File* mp3_file = dynamic_cast<TagLib::MPEG::File*>(file);
-		if(!mp3_file) {
-			throw std::runtime_error(filename + " is not an valid mp3 file.");
-		}
-		offset = mp3_file->firstFrameOffset();
-		offset = mp3_file->nextFrameOffset(offset + 2000000);
-	}
-
-	std::ifstream mp3(filename);
-	if(!mp3) {
-		throw std::runtime_error("Failed to open: " + filename);
-	}
-	std::vector<uint8_t> data((std::istreambuf_iterator<char>(mp3)), std::istreambuf_iterator<char>());
-	mp3.close();
-
-	mad_stream mp3_stream;
-	mad_stream_init(&mp3_stream);
-
-	mad_stream_buffer(&mp3_stream, data.data(), data.size());
-	mad_stream_skip(&mp3_stream, offset);
-
-	mad_frame frame;
-	mad_frame_init(&frame);
+	Mp3FrameGenerator gen(filename);
 
 	PaStreamParameters stream_parameters;
 	PaStream* stream;
@@ -69,7 +121,7 @@ int main(int argc, char* argv[]) {
 	stream_parameters.suggestedLatency = Pa_GetDeviceInfo(stream_parameters.device)->defaultLowOutputLatency;
 	stream_parameters.hostApiSpecificStreamInfo = nullptr;
 
-	error = Pa_OpenStream(&stream, NULL, &stream_parameters, 44100, 1152, paNoFlag, NULL, NULL);
+	error = Pa_OpenStream(&stream, NULL, &stream_parameters, 44100, 1152, paNoFlag, &play_callback, &gen);
 
 	if(error != paNoError) {
 		throw std::runtime_error(std::string("Failed to open portaudio stream ") + Pa_GetErrorText(error));
@@ -80,32 +132,8 @@ int main(int argc, char* argv[]) {
 		throw std::runtime_error("Failed to start portaudio stream.");
 	}
 
-	std::vector<float> buffer;
-	while(mp3_stream.error != MAD_ERROR_BUFLEN) { //EOB
-		mad_frame_decode(&frame, &mp3_stream);
-
-		mad_synth synth;
-		mad_synth_init(&synth);
-
-		mad_synth_frame(&synth, &frame);
-
-		unsigned short nr_channels = synth.pcm.channels;
-		unsigned short nr_samples = synth.pcm.length;
-
-		buffer.resize(nr_channels * nr_samples);
-
-		for(int i = 0; i < nr_channels; i++) {
-			for(int j = 0; j < synth.pcm.length; j++) {
-				buffer[(nr_channels*j) + i] = static_cast<float>(mad_f_todouble(synth.pcm.samples[i][j])) / 8;
-			}
-		}
-
-
-		error = Pa_WriteStream(stream, buffer.data(), synth.pcm.length);
-		if(error != paNoError) {
-			throw std::runtime_error("Failed to write to stream.");
-		}
-	}
+	//play for 10 seconds
+	Pa_Sleep(10000);
 
 	error = Pa_StopStream(stream);
 	if(error != paNoError) {
@@ -118,10 +146,6 @@ int main(int argc, char* argv[]) {
 	}
 
 	Pa_Terminate();
-
-	mad_synth_finish(&synth);
-	mad_frame_finish(&frame);
-	mad_stream_finish(&mp3_stream);
 
 	return 0;
 }
