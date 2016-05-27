@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <condition_variable>
 
 class Mp3FrameGenerator {
 	mad_stream stream;
@@ -71,6 +72,10 @@ public:
 		return buffer;
 	}
 
+	bool is_done() {
+		return stream.error == MAD_ERROR_BUFLEN;
+	}
+
 	virtual ~Mp3FrameGenerator() {
 		mad_stream_finish(&stream);
 		mad_frame_finish(&frame);
@@ -84,9 +89,23 @@ int play_callback(const void*, void *output, unsigned long frameCount, const PaS
 	std::vector<float> buffer = gen.generate_pcm_data();
 	std::copy_n(buffer.data(), buffer.size(), (float*) output);
 
-	return paContinue;
+	if(gen.is_done()) {
+		return paComplete;
+	} else {
+		return paContinue;
+	}
 }
 
+bool done = false;
+std::mutex mutex;
+std::condition_variable cv;
+
+void finished_callback(void *userData) {
+	auto& gen = *static_cast<Mp3FrameGenerator*>(userData);
+
+	done = true;
+	cv.notify_one();
+}
 
 int main(int argc, char* argv[]) {
 
@@ -122,9 +141,13 @@ int main(int argc, char* argv[]) {
 	stream_parameters.hostApiSpecificStreamInfo = nullptr;
 
 	error = Pa_OpenStream(&stream, NULL, &stream_parameters, 44100, 1152, paNoFlag, &play_callback, &gen);
-
 	if(error != paNoError) {
 		throw std::runtime_error(std::string("Failed to open portaudio stream ") + Pa_GetErrorText(error));
+	}
+
+	error = Pa_SetStreamFinishedCallback(stream, &finished_callback);
+	if (error != paNoError) {
+		throw std::runtime_error("Failed to attach the \"stream finished\" callback.");
 	}
 
 	error = Pa_StartStream(stream);
@@ -132,13 +155,8 @@ int main(int argc, char* argv[]) {
 		throw std::runtime_error("Failed to start portaudio stream.");
 	}
 
-	//play for 10 seconds
-	Pa_Sleep(10000);
-
-	error = Pa_StopStream(stream);
-	if(error != paNoError) {
-		throw std::runtime_error("Failed to stop stream.");
-	}
+	std::unique_lock<std::mutex> lk(mutex);
+	cv.wait(lk, []{return done;});
 
 	error = Pa_CloseStream(stream);
 	if(error != paNoError) {
